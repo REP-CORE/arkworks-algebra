@@ -849,12 +849,17 @@ fn msm_bigint_wnaf<V: VariableBaseMSM>(
     cfg_chunks!(bases, chunk_size)
         .zip(cfg_chunks!(scalars, chunk_size))
         .map(|(bases, scalars)| {
+            // REP (2026-10-02): a per-chunk pool can fail to spawn its threads (EAGAIN on iOS near
+            // the process thread budget, e.g. after a WebView login); run the chunk on the current
+            // pool instead of panicking the prover.
             #[cfg(feature = "parallel")]
-            let result = rayon::ThreadPoolBuilder::new()
+            let result = match rayon::ThreadPoolBuilder::new()
                 .num_threads(THREADS_PER_CHUNK.min(rayon::current_num_threads()))
                 .build()
-                .unwrap()
-                .install(|| msm_bigint_wnaf_parallel::<V>(bases, scalars));
+            {
+                Ok(pool) => pool.install(|| msm_bigint_wnaf_parallel::<V>(bases, scalars)),
+                Err(_) => msm_bigint_wnaf_parallel::<V>(bases, scalars),
+            };
 
             #[cfg(not(feature = "parallel"))]
             let result = msm_bigint_wnaf_parallel::<V>(bases, scalars);
