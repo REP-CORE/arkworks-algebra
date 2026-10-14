@@ -812,6 +812,40 @@ fn msm_bigint_wnaf_parallel<V: VariableBaseMSM>(
 #[cfg(feature = "parallel")]
 const THREADS_PER_CHUNK: usize = 2;
 
+/// REP diagnostics, read by the host (jolt-mobile): how often a chunk ran on the current pool
+/// because its own pool could not spawn. Touched only on that failure path: no cost when pools build.
+#[cfg(feature = "parallel")]
+static MSM_POOL_FALLBACKS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The first pool-build error, with the pool size asked for and the process thread count then.
+#[cfg(feature = "parallel")]
+static MSM_POOL_FIRST_ERROR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// A process thread counter the host can supply (mach task_threads on Apple), read on the first error.
+#[cfg(feature = "parallel")]
+static MSM_POOL_PROBE: std::sync::OnceLock<fn() -> u64> = std::sync::OnceLock::new();
+
+/// Install the thread counter read when the first pool build fails. First call wins.
+pub fn set_msm_pool_probe(_f: fn() -> u64) {
+    #[cfg(feature = "parallel")]
+    { let _ = MSM_POOL_PROBE.set(_f); }
+}
+
+/// The first pool-build failure in this process, if any.
+pub fn msm_pool_first_error() -> Option<String> {
+    #[cfg(feature = "parallel")]
+    { MSM_POOL_FIRST_ERROR.get().cloned() }
+    #[cfg(not(feature = "parallel"))]
+    { None }
+}
+
+/// Process-wide count of MSM pool fallbacks since start (always 0 without `parallel`).
+pub fn msm_pool_fallbacks() -> usize {
+    #[cfg(feature = "parallel")]
+    { MSM_POOL_FALLBACKS.load(core::sync::atomic::Ordering::Relaxed) }
+    #[cfg(not(feature = "parallel"))]
+    { 0 }
+}
+
 /// Computes an MSM using the windowed non-adjacent form (WNAF) algorithm.
 /// To improve parallelism, when number of threads is at least 2, this
 /// function will split the input into enough chunks so that each chunk
@@ -849,12 +883,26 @@ fn msm_bigint_wnaf<V: VariableBaseMSM>(
     cfg_chunks!(bases, chunk_size)
         .zip(cfg_chunks!(scalars, chunk_size))
         .map(|(bases, scalars)| {
+            // REP: a per-chunk pool can fail to spawn its threads. On iOS this pool churn alone
+            // takes one Jolt prove to 1,024 process threads, which we read as iOS's per-process
+            // limit (measured 2026-10-14: EAGAIN, 408-566 failed builds per prove). Run the chunk
+            // on the current pool instead of panicking: same result, less parallelism for it.
             #[cfg(feature = "parallel")]
-            let result = rayon::ThreadPoolBuilder::new()
+            let result = match rayon::ThreadPoolBuilder::new()
                 .num_threads(THREADS_PER_CHUNK.min(rayon::current_num_threads()))
                 .build()
-                .unwrap()
-                .install(|| msm_bigint_wnaf_parallel::<V>(bases, scalars));
+            {
+                Ok(pool) => pool.install(|| msm_bigint_wnaf_parallel::<V>(bases, scalars)),
+                Err(e) => {
+                    if MSM_POOL_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) == 0 {
+                        let threads = MSM_POOL_PROBE.get().map(|f| f()).unwrap_or(0);
+                        let wanted = THREADS_PER_CHUNK.min(rayon::current_num_threads());
+                        let first = format!("{e:?} wanted={wanted} current_pool={} process_threads={threads}", rayon::current_num_threads());
+                        let _ = MSM_POOL_FIRST_ERROR.set(first);
+                    }
+                    msm_bigint_wnaf_parallel::<V>(bases, scalars)
+                },
+            };
 
             #[cfg(not(feature = "parallel"))]
             let result = msm_bigint_wnaf_parallel::<V>(bases, scalars);

@@ -1,0 +1,25 @@
+# REP: native repro for the msm_bigint_wnaf per-chunk pool fallback. Standalone (own workspace),
+# so it never changes how the arkworks workspace builds.
+#   cargo test --release            # the fallback test (exhausts this process's threads)
+#   cargo run --release -- exhaust 0  # one MSM with zero free thread slots
+[package]
+name = "msm-pool-exhaustion"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "repro"
+path = "src/main.rs"
+
+[dependencies]
+ark-ec = { path = "../../ec", features = ["parallel"] }
+ark-ff = { path = "../../ff", features = ["parallel"] }
+ark-std = { version = "0.5.0", features = ["std", "parallel"] }
+ark-bn254 = { path = "../../curves/bn254", features = ["std"] }
+rayon = "1"
+
+[profile.release]
+debug = false
